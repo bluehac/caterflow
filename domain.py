@@ -79,14 +79,26 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
         # Only call with an authenticated provider response, never browser JSON.
         with self.db() as d:
             q=self.get_quote(d,u,qid)
-            if event_id and d.execute('SELECT 1 FROM webhook_events WHERE id=?',(event_id,)).fetchone(): return
+            if event_id and d.execute('SELECT 1 FROM webhook_events WHERE id=?',(event_id,)).fetchone(): return dict(q)
             if q['payment_status']=='REVIEW_REQUIRED': raise ValueError('Payment hold requires operator review')
             model=Quote(qid,q['guests'],q['price'],True,q['order_id'],q['capture_id'])
             model.reconcile(response,merchant)
             if not q['customer_approved']: raise ValueError('Customer approval missing')
+            operations=d.execute('SELECT * FROM payment_operations WHERE quote=?',(qid,)).fetchall()
+            for operation in operations:
+                if operation['provider_id'] not in (None,q['order_id']):
+                    raise ValueError('Conflicting payment operation requires operator review')
             d.execute("UPDATE quotes SET capture_id=?,payment_status='COMPLETED' WHERE id=?",(model.capture_id,qid))
+            # Only a fully validated COMPLETED receipt can resolve uncertainty.
+            # Preserve original request IDs and never clear a payment hold here.
+            for operation in operations:
+                if operation['state'] in ('IN_FLIGHT','UNCERTAIN'):
+                    d.execute("UPDATE payment_operations SET state='SUCCEEDED',provider_id=?,updated=? WHERE quote=? AND kind=?",
+                              (q['order_id'],time.time(),qid,operation['kind']))
+                    self.log(d,u,'PAYMENT_OPERATION_RECONCILED_'+operation['kind'].upper(),qid)
             if event_id: d.execute('INSERT INTO webhook_events(id) VALUES(?)',(event_id,))
             self.log(d,u,'PAYMENT_VERIFIED',qid)
+            return dict(d.execute('SELECT * FROM quotes WHERE id=?',(qid,)).fetchone())
     def book(self,u,qid):
         if u['role']!='caterer': raise PermissionError('Caterer confirmation required')
         with self.db() as d:
@@ -139,6 +151,8 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
             # replay. Hiding checkout in the UI is not payment authorization.
             if q['payment_status']=='REVIEW_REQUIRED': raise ValueError('Payment hold requires operator review')
             if kind=='capture' and not q['order_id']: raise ValueError('Missing order')
+            if kind=='capture' and (q['capture_id'] or q['payment_status']=='COMPLETED'):
+                raise ValueError('Recorded payment requires authenticated reconciliation')
             row=d.execute('SELECT * FROM payment_operations WHERE quote=? AND kind=?',(qid,kind)).fetchone()
             if row:
                 # Uncertain operations never retry automatically, even after restart.
@@ -151,6 +165,13 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
     def finish_payment_operation(self,u,qid,kind,provider_id=None):
         with self.db() as d:
             self.get_quote(d,u,qid)
+            existing=d.execute('SELECT * FROM payment_operations WHERE quote=? AND kind=?',(qid,kind)).fetchone()
+            if existing and existing['state']=='SUCCEEDED':
+                # A webhook/readback may finish the operation before its request
+                # returns or times out. Never downgrade that verified success.
+                if provider_id and provider_id!=existing['provider_id']:
+                    raise ValueError('Conflicting provider operation')
+                return
             if not provider_id: state='UNCERTAIN'
             else: state='SUCCEEDED'
             changed=d.execute("UPDATE payment_operations SET state=?,provider_id=?,updated=? WHERE quote=? AND kind=? AND state='IN_FLIGHT'",(state,provider_id,time.time(),qid,kind)).rowcount
