@@ -51,3 +51,7 @@ Sources checked November 8, 2026:
 Prioritized proposed differentiators: instant reviewed event brief; operator-grounded menu options; good/better/best budget comparisons with exact fee/tax breakdown; explain what changes when guest count/menu/service changes; one focused follow-up at a time; bilingual read-aloud and editable transcripts; allergy uncertainty and chef handoff; inquiry receipt/status and private staff notification after a verified connection. None is a verified exclusive market feature. Measure completion, corrections, quote turnaround, gross margin and support effort before claiming advantage.
 
 Technology decision: Turnstile plus server/proxy limits first; one analytics system (PostHog default, Mixpanel alternative) and scrubbed errors next; Postgres/tenant isolation/configuration before multi-business GTM. MongoDB, Crusoe GPU hosting, Meta inference and a Replit migration are deferred until an actual bottleneck or approved benchmark justifies them. Extra vendor count is not differentiation.
+
+## Validation recorded
+
+137 Python tests and 10 JSDOM interface tests passed locally after this increment. Tests cover cross-instance account limits, expiry, daily cap, token failures and hostname/action checks, fail-closed configuration/outage, pre-provider route rejection, retired endpoint, exact estimate arithmetic/rounding, unapproved/expired policies and price injection. No real AI, Turnstile or PayPal request was made by these tests. Browser challenge interaction and hosted acceptance remain pending.
