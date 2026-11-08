@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-*
+.venv/
+venv/
+.env
+.env.*
+*secret*.json
+*credential*.json
+paypal-sandbox.json
+*.pem
+*.key
