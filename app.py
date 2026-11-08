@@ -63,10 +63,19 @@ class Handler(BaseHTTPRequestHandler):
                 if os.environ.get('CATERFLOW_PAYPAL_ENABLED')!='true': raise ValueError('Sandbox checkout disabled')
                 return self.reply(200,Webhooks(store,PayPal()).handle(b,dict(self.headers)))
             if self.path=='/api/login':
-                ip=self.client_address[0]; recent=[t for t in attempts.get(ip,[]) if time.time()-t<60]; attempts[ip]=recent+[time.time()]
-                if len(recent)>=10: raise PermissionError('Wait a minute before trying again')
+                # Count failures only. Never trust client-supplied forwarded IPs.
+                # Keep the existing 10-failure/60s policy; bound process memory.
+                ip=self.client_address[0]; now=time.time()
+                for key,values in list(attempts.items()):
+                    recent=[t for t in values if now-t<60]
+                    if recent:attempts[key]=recent
+                    else:attempts.pop(key,None)
+                recent=attempts.get(ip,[])
+                if len(recent)>=10 or (ip not in attempts and len(attempts)>=1024): raise PermissionError('Wait a minute before trying again')
                 u=store.login(str(b.get('id','')),str(b.get('password','')))
-                if not u: raise PermissionError('Sign-in failed')
+                if not u:
+                    attempts[ip]=recent+[now]
+                    raise PermissionError('Sign-in failed')
                 sid,_=store.new_session(u)
                 return self.reply(200,{'ok':True},'cf_session='+sid+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600'+SECURE_COOKIE)
             s=self.user()
