@@ -1,0 +1,2 @@
+# Optional, required only when CATERFLOW_PHOTO_ENABLED=true
+Pillow>=12.0.0,<14
