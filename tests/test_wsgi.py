@@ -63,3 +63,27 @@ class WsgiTests(unittest.TestCase):
    good=self.request('/api/ai/draft','POST',{'text':'x'*20000},HTTP_COOKIE=cookie,HTTP_X_CSRF_TOKEN=session['csrf'])
    self.assertTrue(good['status'].startswith('200'));adapter.return_value.draft.assert_called_once()
    self.assertTrue(self.request('/api/login','POST',{'text':'x'*20000})['status'].startswith('400'))
+ def test_successful_logins_do_not_exhaust_failure_allowance(self):
+  with patch.dict(self.app.attempts,{},clear=True):
+   for _ in range(15):
+    response=self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})
+    self.assertTrue(response['status'].startswith('200'))
+   self.assertEqual(self.app.attempts,{})
+ def test_failed_login_limit_is_preserved_and_blocked_requests_do_not_extend_it(self):
+  with patch.dict(self.app.attempts,{},clear=True),patch.object(self.app.time,'time',return_value=1000):
+   for _ in range(10):
+    self.assertTrue(self.request('/api/login','POST',{'id':'demo','password':'wrong'})['status'].startswith('403'))
+   before=list(self.app.attempts['127.0.0.1'])
+   blocked=self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})
+   self.assertIn(b'Wait a minute',blocked['body']);self.assertEqual(self.app.attempts['127.0.0.1'],before)
+  with patch.dict(self.app.attempts,{'127.0.0.1':[1000]*10},clear=True),patch.object(self.app.time,'time',return_value=1061):
+   self.assertTrue(self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})['status'].startswith('200'))
+ def test_success_does_not_clear_prior_failure_history(self):
+  with patch.dict(self.app.attempts,{'127.0.0.1':[1000]*3},clear=True),patch.object(self.app.time,'time',return_value=1001):
+   self.assertTrue(self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})['status'].startswith('200'))
+   self.assertEqual(self.app.attempts['127.0.0.1'],[1000]*3)
+ def test_limiter_memory_is_bounded_without_evicting_active_failures(self):
+  full={str(i):[1000] for i in range(1024)}
+  with patch.dict(self.app.attempts,full,clear=True),patch.object(self.app.time,'time',return_value=1001):
+   self.assertTrue(self.request('/api/login','POST',{'id':'demo','password':'wrong'})['status'].startswith('403'))
+   self.assertEqual(len(self.app.attempts),1024)
