@@ -44,3 +44,22 @@ class WsgiTests(unittest.TestCase):
   r=self.request('/api/login','POST',{},CONTENT_LENGTH='99999')
   self.assertTrue(r['status'].startswith('400'))
   self.assertTrue(self.request(method='PUT')['status'].startswith('405'))
+ def test_expanded_photo_body_requires_authentication_before_read(self):
+  class Unread(io.BytesIO):
+   def read(self,*args):raise AssertionError('Unauthenticated photo body was read')
+  env={'PATH_INFO':'/api/ai/draft','REQUEST_METHOD':'POST','HTTP_HOST':'caterflow.example.test','HTTP_ORIGIN':'https://caterflow.example.test','CONTENT_TYPE':'application/json','CONTENT_LENGTH':'500000','wsgi.input':Unread(b''),'REMOTE_ADDR':'127.0.0.1'}
+  response={}
+  with patch.dict(os.environ,{'CATERFLOW_PHOTO_ENABLED':'true'}):
+   b''.join(self.wsgi.application(env,lambda status,headers:response.update(status=status)))
+  self.assertTrue(response['status'].startswith('403'))
+ def test_photo_route_authenticates_and_keeps_other_route_size_limits(self):
+  login=self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})
+  cookie=login['headers']['Set-Cookie'].split(';')[0]
+  session=json.loads(self.request('/api/events',HTTP_COOKIE=cookie)['body'])
+  with patch.dict(os.environ,{'CATERFLOW_PHOTO_ENABLED':'true'}),patch.object(self.app,'BedrockIntake') as adapter:
+   adapter.return_value.draft.return_value={'requires_customer_review':True}
+   bad=self.request('/api/ai/draft','POST',{'text':'x'*20000},HTTP_COOKIE=cookie,HTTP_X_CSRF_TOKEN='wrong')
+   self.assertTrue(bad['status'].startswith('403'));adapter.assert_not_called()
+   good=self.request('/api/ai/draft','POST',{'text':'x'*20000},HTTP_COOKIE=cookie,HTTP_X_CSRF_TOKEN=session['csrf'])
+   self.assertTrue(good['status'].startswith('200'));adapter.return_value.draft.assert_called_once()
+   self.assertTrue(self.request('/api/login','POST',{'text':'x'*20000})['status'].startswith('400'))
