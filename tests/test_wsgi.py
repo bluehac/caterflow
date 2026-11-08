@@ -87,3 +87,24 @@ class WsgiTests(unittest.TestCase):
   with patch.dict(self.app.attempts,full,clear=True),patch.object(self.app.time,'time',return_value=1001):
    self.assertTrue(self.request('/api/login','POST',{'id':'demo','password':'wrong'})['status'].startswith('403'))
    self.assertEqual(len(self.app.attempts),1024)
+ def test_turnstile_failure_prevents_login_and_sensitive_actions(self):
+  from abuse import VerificationUnavailable
+  with patch.object(self.app,'verify',side_effect=VerificationUnavailable('Unavailable')),patch.object(self.app.store,'login') as login:
+   response=self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})
+   self.assertTrue(response['status'].startswith('503'));login.assert_not_called()
+  login=self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})
+  cookie=login['headers']['Set-Cookie'].split(';')[0]
+  session=json.loads(self.request('/api/events',HTTP_COOKIE=cookie)['body'])
+  with patch.object(self.app,'verify',side_effect=PermissionError('Verification failed')),patch.object(self.app,'BedrockIntake') as ai,patch.object(self.app.store,'intake') as intake:
+   for path in ('/api/ai/draft','/api/intake'):
+    response=self.request(path,'POST',{},HTTP_COOKIE=cookie,HTTP_X_CSRF_TOKEN=session['csrf'])
+    self.assertTrue(response['status'].startswith('403'))
+   ai.assert_not_called();intake.assert_not_called()
+ def test_abuse_limit_blocks_before_provider_call_and_returns_429(self):
+  from abuse import RateLimited
+  login=self.request('/api/login','POST',{'id':'demo','password':'synthetic-password-long'})
+  cookie=login['headers']['Set-Cookie'].split(';')[0]
+  session=json.loads(self.request('/api/events',HTTP_COOKIE=cookie)['body'])
+  with patch.object(self.app,'reserve',side_effect=RateLimited('Wait')),patch.object(self.app,'BedrockIntake') as ai:
+   response=self.request('/api/ai/draft','POST',{'text':'Synthetic event'},HTTP_COOKIE=cookie,HTTP_X_CSRF_TOKEN=session['csrf'])
+   self.assertTrue(response['status'].startswith('429'));ai.assert_not_called()
