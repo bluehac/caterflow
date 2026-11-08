@@ -57,3 +57,27 @@ test('read-aloud voices use selected language and exact displayed summary',async
  const x=await setup();x.find('🔊 Listen').click();assert.match(x.spoken[0].text,/Speak, type or show/);assert.equal(x.spoken[0].lang,'en-US');
  x.doc.getElementById('language').click();x.find('🔊 Escuchar').click();assert.equal(x.spoken[1].lang,'es-US');x.dom.window.close();
 });
+for(const language of ['en','es'])test('expired session restores sign-in and retains draft/key: '+language,async()=>{
+ const x=await setup();const requests=[];let intakeCount=0;
+ x.dom.window.fetch=async(url,request)=>{
+  if(url==='/api/events')return {ok:true,json:async()=>({user:{role:'customer'},csrf:'new-token'})};
+  requests.push({url,headers:request.headers,body:JSON.parse(request.body)});
+  if(url==='/api/intake' && intakeCount++===0)return {ok:false,status:403,json:async()=>({error:'Please sign in'})};
+  return {ok:true,json:async()=>({result:'saved'})};
+ };
+ x.dom.window.eval(`lang='${language}';step=3;Object.assign(data,{title:'Retained birthday',guests:40,location:'Oakland'});render()`);
+ await x.doc.getElementById('form').onsubmit({preventDefault(){}});
+ assert.ok(x.doc.getElementById('id'));assert.ok(x.doc.body.textContent.includes('Retained birthday'));
+ assert.ok(x.doc.getElementById('status').textContent.includes(language==='es'?'caducado':'expired'));
+ assert.equal(requests.length,1);
+ x.doc.getElementById('id').value='synthetic-customer';x.doc.getElementById('password').value='synthetic-password';
+ await x.doc.getElementById('form').onsubmit({preventDefault(){}});
+ const intakes=requests.filter(r=>r.url==='/api/intake');assert.equal(intakes.length,2);
+ assert.equal(intakes[0].headers['Idempotency-Key'],intakes[1].headers['Idempotency-Key']);
+ assert.equal(intakes[1].headers['X-CSRF-Token'],'new-token');assert.equal(intakes[1].body.title,'Retained birthday');x.dom.window.close();
+});
+test('unrelated forbidden response does not pretend session expired or resubmit',async()=>{
+ const x=await setup();let calls=0;x.dom.window.fetch=async()=>{calls++;return {ok:false,status:403,json:async()=>({error:'Request verification failed'})}};
+ x.dom.window.eval('step=3;render()');await x.doc.getElementById('form').onsubmit({preventDefault(){}});
+ assert.equal(x.doc.getElementById('id'),null);assert.match(x.doc.getElementById('status').textContent,/verification failed/);assert.equal(calls,1);x.dom.window.close();
+});
