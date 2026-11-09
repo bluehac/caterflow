@@ -1,4 +1,5 @@
 """Server-only orchestration. Never accepts provider receipts from the browser."""
+import json
 from core import Quote
 class Payments:
     def __init__(self,store,provider): self.store=store;self.provider=provider
@@ -10,7 +11,7 @@ class Payments:
         if op['state']=='SUCCEEDED': return self.provider.order(op['provider_id'])
         q=self.snapshot(u,qid)
         try:
-            response=self.provider.create(Quote(qid,q['guests'],q['price'],True),return_url,key=op['request_id'])
+            response=self.provider.create(Quote.from_record(q),return_url,key=op['request_id'])
             oid=response.get('id')
             if not isinstance(oid,str) or not oid: raise ValueError('Provider did not acknowledge order')
             self.store.bind(u,qid,oid)
@@ -33,7 +34,7 @@ class Payments:
             return self.result(self.store.reconcile(u,qid,response,self.provider.merchant))
         if q['capture_id'] or q['payment_status']=='COMPLETED':
             raise ValueError('Recorded payment requires authenticated reconciliation')
-        Quote(qid,q['guests'],q['price'],True,q['order_id']).validate_capture_ready(response,self.provider.merchant)
+        Quote.from_record(q).validate_capture_ready(response,self.provider.merchant)
         # Recheck authority/hold and take the durable claim after the provider read.
         op=self.store.begin_payment_operation(u,qid,'capture');q=self.snapshot(u,qid)
         if op['state']=='SUCCEEDED': return self.reconcile(u,qid)
@@ -54,4 +55,5 @@ class Payments:
         return self.result(self.store.reconcile(u,qid,response,self.provider.merchant))
     @staticmethod
     def result(q):
-        return {'payment_status':q['payment_status'],'booking_status':'BOOKED' if q['booked'] else 'AWAITING_CATERER'}
+        terms=json.loads(q['terms']) if q.get('terms') else None
+        return {**({'payment_kind':'DEPOSIT','balance_due':terms['balance_due']} if terms else {}),'payment_status':q['payment_status'],'booking_status':'BOOKED' if q['booked'] else 'AWAITING_CATERER'}

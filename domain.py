@@ -3,6 +3,7 @@ import sqlite3, json, uuid, hashlib, secrets, time
 from intake import validate_intake
 from contextlib import contextmanager
 from core import Quote
+from estimates import estimate
 
 class Store:
     def __init__(self,path):
@@ -12,6 +13,9 @@ class Store:
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, role TEXT NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, guests INTEGER NOT NULL, notes TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY, event TEXT NOT NULL, revision INTEGER NOT NULL, guests INTEGER NOT NULL, price TEXT NOT NULL, total TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0, customer_approved INTEGER NOT NULL DEFAULT 0, order_id TEXT UNIQUE, capture_id TEXT UNIQUE, booked INTEGER NOT NULL DEFAULT 0, payment_status TEXT NOT NULL DEFAULT 'UNPAID', UNIQUE(event,revision));
+CREATE TABLE IF NOT EXISTS quote_terms(quote TEXT PRIMARY KEY REFERENCES quotes(id), snapshot TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS freeze_terms_update BEFORE UPDATE ON quote_terms BEGIN SELECT RAISE(ABORT,'Quote terms are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS freeze_terms_delete BEFORE DELETE ON quote_terms BEGIN SELECT RAISE(ABORT,'Quote terms are immutable'); END;
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL, resource TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS inquiry_requests(owner TEXT NOT NULL, request_key TEXT NOT NULL, payload_hash TEXT NOT NULL, event TEXT NOT NULL REFERENCES events(id), PRIMARY KEY(owner,request_key));
 CREATE TABLE IF NOT EXISTS intake_details(event TEXT PRIMARY KEY REFERENCES events(id), payload TEXT NOT NULL);
@@ -50,11 +54,17 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
         e=d.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e or (u['role']!='caterer' and e['owner']!=u['id']): raise PermissionError('Event unavailable')
         return e
-    def quote(self,u,eid,price,*,corrects=None):
+    def quote(self,u,eid,price,*,corrects=None,policy=None,selection=None):
         if u['role']!='caterer': raise PermissionError('Caterer access required')
         qid=uuid.uuid4().hex
         with self.db() as d:
             e=self.allowed(d,u,eid); q=Quote(qid,e['guests'],price)
+            terms=None
+            if policy is not None or selection is not None:
+                if not isinstance(selection,dict) or selection.get('guests')!=q.guests:
+                    raise ValueError('Quote guest count must match the inquiry')
+                terms=estimate(policy,selection)
+                if 'deposit_due' not in terms: raise ValueError('Deposit policy required')
             if corrects is None:
                 if d.execute('SELECT 1 FROM quotes WHERE event=? AND (order_id IS NOT NULL OR customer_approved=1)',(eid,)).fetchone(): raise ValueError('Payment or customer approval already started; reconcile first')
             else:
@@ -69,10 +79,11 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
                 # the current revision under the same SQLite write lock.
                 self.log(d,u,'QUOTE_SUPERSEDED',corrects)
             rev=d.execute('SELECT coalesce(max(revision),0)+1 FROM quotes WHERE event=?',(eid,)).fetchone()[0]
-            d.execute('INSERT INTO quotes(id,event,revision,guests,price,total,approved) VALUES(?,?,?,?,?,?,1)',(qid,eid,rev,q.guests,q.unit_price,q.total)); self.log(d,u,'QUOTE_APPROVED',qid)
+            d.execute('INSERT INTO quotes(id,event,revision,guests,price,total,approved) VALUES(?,?,?,?,?,?,1)',(qid,eid,rev,q.guests,q.unit_price,terms['total'] if terms else q.total)); self.log(d,u,'QUOTE_APPROVED',qid)
+            if terms: d.execute('INSERT INTO quote_terms VALUES(?,?)',(qid,json.dumps(terms,sort_keys=True)))
         return qid
     def get_quote(self,d,u,qid):
-        q=d.execute('SELECT * FROM quotes WHERE id=?',(qid,)).fetchone()
+        q=d.execute('SELECT quotes.*,quote_terms.snapshot AS terms FROM quotes LEFT JOIN quote_terms ON quote_terms.quote=quotes.id WHERE quotes.id=?',(qid,)).fetchone()
         if not q: raise ValueError('Quote unavailable')
         self.allowed(d,u,q['event']); return q
     def require_current_quote(self,d,q):
@@ -97,7 +108,7 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
             q=self.get_quote(d,u,qid)
             if event_id and d.execute('SELECT 1 FROM webhook_events WHERE id=?',(event_id,)).fetchone(): return dict(q)
             if q['payment_status']=='REVIEW_REQUIRED': raise ValueError('Payment hold requires operator review')
-            model=Quote(qid,q['guests'],q['price'],True,q['order_id'],q['capture_id'])
+            model=Quote.from_record(q)
             model.reconcile(response,merchant)
             if not q['customer_approved']: raise ValueError('Customer approval missing')
             operations=d.execute('SELECT * FROM payment_operations WHERE quote=?',(qid,)).fetchall()
@@ -114,7 +125,7 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
                     self.log(d,u,'PAYMENT_OPERATION_RECONCILED_'+operation['kind'].upper(),qid)
             if event_id: d.execute('INSERT INTO webhook_events(id) VALUES(?)',(event_id,))
             self.log(d,u,'PAYMENT_VERIFIED',qid)
-            return dict(d.execute('SELECT * FROM quotes WHERE id=?',(qid,)).fetchone())
+            return dict(self.get_quote(d,u,qid))
     def book(self,u,qid):
         if u['role']!='caterer': raise PermissionError('Caterer confirmation required')
         with self.db() as d:
@@ -124,7 +135,7 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
     def list(self,u):
         with self.db() as d:
             es=d.execute('SELECT * FROM events'+('' if u['role']=='caterer' else ' WHERE owner=?'),() if u['role']=='caterer' else (u['id'],)).fetchall()
-            return [dict(e,quotes=[dict(q) for q in d.execute('SELECT * FROM quotes WHERE event=? ORDER BY revision DESC',(e['id'],))]) for e in es]
+            return [dict(e,quotes=[dict(q) for q in d.execute('SELECT quotes.*,quote_terms.snapshot AS terms FROM quotes LEFT JOIN quote_terms ON quote_terms.quote=quotes.id WHERE event=? ORDER BY revision DESC',(e['id'],))]) for e in es]
 
     def intake(self,u,data,request_key=None):
         if u['role']!='customer': raise PermissionError('Customer access required')
