@@ -38,4 +38,11 @@ def estimate(policy,selection):
     fee=cents(money(service['fixed'])+food*rate)
     taxable=food+(fee if service['taxable'] else Decimal('0'))
     tax=cents(taxable*taxrate);total=food+fee+tax
-    return {'status':'ESTIMATE_ONLY','currency':'USD','policy_version':policy['version'],'policy_hash':hashlib.sha256(json.dumps(policy,sort_keys=True).encode()).hexdigest(),'food':str(cents(food)),'service_fee':str(fee),'taxable_base':str(cents(taxable)),'tax':str(tax),'total':str(cents(total)),'per_guest':str(cents(total/guests)),'line_items':lines,'tax_source':policy['tax_source'],'valid_until':policy['valid_until'],'requires_caterer_review':True,'booking_confirmed':False}
+    payment_terms={}
+    if 'deposit_rate' in policy:
+        deposit_rate=money(policy['deposit_rate'])
+        if not 0<deposit_rate<=1:raise ValueError('Deposit rate must be greater than zero and at most one')
+        deposit=cents(total*deposit_rate)
+        if deposit<=0:raise EstimateUnavailable('Configured deposit rounds to zero')
+        payment_terms={'deposit_due':str(deposit),'balance_due':str(cents(total-deposit))}
+    return {**payment_terms,'status':'ESTIMATE_ONLY','currency':'USD','policy_version':policy['version'],'policy_hash':hashlib.sha256(json.dumps(policy,sort_keys=True).encode()).hexdigest(),'food':str(cents(food)),'service_fee':str(fee),'taxable_base':str(cents(taxable)),'tax':str(tax),'total':str(cents(total)),'per_guest':str(cents(total/guests)),'line_items':lines,'tax_source':policy['tax_source'],'valid_until':policy['valid_until'],'requires_caterer_review':True,'booking_confirmed':False}
