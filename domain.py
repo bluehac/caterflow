@@ -3,6 +3,7 @@ import sqlite3, json, uuid, hashlib, secrets, time
 from intake import validate_intake
 from contextlib import contextmanager
 from core import Quote
+from estimates import estimate
 
 class Store:
     def __init__(self,path):
@@ -12,6 +13,9 @@ class Store:
 CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, role TEXT NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, owner TEXT NOT NULL, title TEXT NOT NULL, guests INTEGER NOT NULL, notes TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY, event TEXT NOT NULL, revision INTEGER NOT NULL, guests INTEGER NOT NULL, price TEXT NOT NULL, total TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0, customer_approved INTEGER NOT NULL DEFAULT 0, order_id TEXT UNIQUE, capture_id TEXT UNIQUE, booked INTEGER NOT NULL DEFAULT 0, payment_status TEXT NOT NULL DEFAULT 'UNPAID', UNIQUE(event,revision));
+CREATE TABLE IF NOT EXISTS quote_terms(quote TEXT PRIMARY KEY REFERENCES quotes(id), snapshot TEXT NOT NULL);
+CREATE TRIGGER IF NOT EXISTS freeze_terms_update BEFORE UPDATE ON quote_terms BEGIN SELECT RAISE(ABORT,'Quote terms are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS freeze_terms_delete BEFORE DELETE ON quote_terms BEGIN SELECT RAISE(ABORT,'Quote terms are immutable'); END;
 CREATE TABLE IF NOT EXISTS audit(seq INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL, resource TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS inquiry_requests(owner TEXT NOT NULL, request_key TEXT NOT NULL, payload_hash TEXT NOT NULL, event TEXT NOT NULL REFERENCES events(id), PRIMARY KEY(owner,request_key));
 CREATE TABLE IF NOT EXISTS intake_details(event TEXT PRIMARY KEY REFERENCES events(id), payload TEXT NOT NULL);
@@ -50,28 +54,51 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
         e=d.execute('SELECT * FROM events WHERE id=?',(eid,)).fetchone()
         if not e or (u['role']!='caterer' and e['owner']!=u['id']): raise PermissionError('Event unavailable')
         return e
-    def quote(self,u,eid,price):
+    def quote(self,u,eid,price,*,corrects=None,policy=None,selection=None):
         if u['role']!='caterer': raise PermissionError('Caterer access required')
         qid=uuid.uuid4().hex
         with self.db() as d:
             e=self.allowed(d,u,eid); q=Quote(qid,e['guests'],price)
-            if d.execute('SELECT 1 FROM quotes WHERE event=? AND (order_id IS NOT NULL OR customer_approved=1)',(eid,)).fetchone(): raise ValueError('Payment or customer approval already started; reconcile first')
+            terms=None
+            if policy is not None or selection is not None:
+                if not isinstance(selection,dict) or selection.get('guests')!=q.guests:
+                    raise ValueError('Quote guest count must match the inquiry')
+                terms=estimate(policy,selection)
+                if 'deposit_due' not in terms: raise ValueError('Deposit policy required')
+            if corrects is None:
+                if d.execute('SELECT 1 FROM quotes WHERE event=? AND (order_id IS NOT NULL OR customer_approved=1)',(eid,)).fetchone(): raise ValueError('Payment or customer approval already started; reconcile first')
+            else:
+                current=d.execute('SELECT * FROM quotes WHERE event=? ORDER BY revision DESC LIMIT 1',(eid,)).fetchone()
+                if not current or current['id']!=corrects or not current['customer_approved']:
+                    raise ValueError('Correction requires the current customer-approved quote')
+                if d.execute("""SELECT 1 FROM quotes q WHERE event=? AND
+                    (order_id IS NOT NULL OR capture_id IS NOT NULL OR booked=1 OR payment_status!='UNPAID'
+                    OR EXISTS(SELECT 1 FROM payment_operations WHERE quote=q.id))""",(eid,)).fetchone():
+                    raise ValueError('Payment already started; reconcile first')
+                # Keep historical approval as evidence. Payment admission checks
+                # the current revision under the same SQLite write lock.
+                self.log(d,u,'QUOTE_SUPERSEDED',corrects)
             rev=d.execute('SELECT coalesce(max(revision),0)+1 FROM quotes WHERE event=?',(eid,)).fetchone()[0]
-            d.execute('INSERT INTO quotes(id,event,revision,guests,price,total,approved) VALUES(?,?,?,?,?,?,1)',(qid,eid,rev,q.guests,q.unit_price,q.total)); self.log(d,u,'QUOTE_APPROVED',qid)
+            d.execute('INSERT INTO quotes(id,event,revision,guests,price,total,approved) VALUES(?,?,?,?,?,?,1)',(qid,eid,rev,q.guests,q.unit_price,terms['total'] if terms else q.total)); self.log(d,u,'QUOTE_APPROVED',qid)
+            if terms: d.execute('INSERT INTO quote_terms VALUES(?,?)',(qid,json.dumps(terms,sort_keys=True)))
         return qid
     def get_quote(self,d,u,qid):
-        q=d.execute('SELECT * FROM quotes WHERE id=?',(qid,)).fetchone()
+        q=d.execute('SELECT quotes.*,quote_terms.snapshot AS terms FROM quotes LEFT JOIN quote_terms ON quote_terms.quote=quotes.id WHERE quotes.id=?',(qid,)).fetchone()
         if not q: raise ValueError('Quote unavailable')
         self.allowed(d,u,q['event']); return q
+    def require_current_quote(self,d,q):
+        if d.execute('SELECT max(revision) FROM quotes WHERE event=?',(q['event'],)).fetchone()[0]!=q['revision']:
+            raise ValueError('Quote superseded')
     def approve(self,u,qid):
         if u['role']!='customer': raise PermissionError('Customer access required')
         with self.db() as d:
             q=self.get_quote(d,u,qid)
-            if d.execute('SELECT max(revision) FROM quotes WHERE event=?',(q['event'],)).fetchone()[0]!=q['revision']: raise ValueError('Quote superseded')
+            self.require_current_quote(d,q)
             d.execute('UPDATE quotes SET customer_approved=1 WHERE id=?',(qid,)); self.log(d,u,'CUSTOMER_APPROVED',qid)
     def bind(self,u,qid,order):
         with self.db() as d:
             q=self.get_quote(d,u,qid)
+            self.require_current_quote(d,q)
             if u['role']!='customer' or not q['customer_approved'] or not q['approved']: raise PermissionError('Customer approval required')
             if not order or (q['order_id'] and q['order_id']!=order): raise ValueError('Conflicting order')
             d.execute('UPDATE quotes SET order_id=? WHERE id=?',(order,qid)); self.log(d,u,'ORDER_BOUND',qid)
@@ -79,14 +106,26 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
         # Only call with an authenticated provider response, never browser JSON.
         with self.db() as d:
             q=self.get_quote(d,u,qid)
-            if event_id and d.execute('SELECT 1 FROM webhook_events WHERE id=?',(event_id,)).fetchone(): return
+            if event_id and d.execute('SELECT 1 FROM webhook_events WHERE id=?',(event_id,)).fetchone(): return dict(q)
             if q['payment_status']=='REVIEW_REQUIRED': raise ValueError('Payment hold requires operator review')
-            model=Quote(qid,q['guests'],q['price'],True,q['order_id'],q['capture_id'])
+            model=Quote.from_record(q)
             model.reconcile(response,merchant)
             if not q['customer_approved']: raise ValueError('Customer approval missing')
+            operations=d.execute('SELECT * FROM payment_operations WHERE quote=?',(qid,)).fetchall()
+            for operation in operations:
+                if operation['provider_id'] not in (None,q['order_id']):
+                    raise ValueError('Conflicting payment operation requires operator review')
             d.execute("UPDATE quotes SET capture_id=?,payment_status='COMPLETED' WHERE id=?",(model.capture_id,qid))
+            # Only a fully validated COMPLETED receipt can resolve uncertainty.
+            # Preserve original request IDs and never clear a payment hold here.
+            for operation in operations:
+                if operation['state'] in ('IN_FLIGHT','UNCERTAIN'):
+                    d.execute("UPDATE payment_operations SET state='SUCCEEDED',provider_id=?,updated=? WHERE quote=? AND kind=?",
+                              (q['order_id'],time.time(),qid,operation['kind']))
+                    self.log(d,u,'PAYMENT_OPERATION_RECONCILED_'+operation['kind'].upper(),qid)
             if event_id: d.execute('INSERT INTO webhook_events(id) VALUES(?)',(event_id,))
             self.log(d,u,'PAYMENT_VERIFIED',qid)
+            return dict(self.get_quote(d,u,qid))
     def book(self,u,qid):
         if u['role']!='caterer': raise PermissionError('Caterer confirmation required')
         with self.db() as d:
@@ -96,7 +135,7 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
     def list(self,u):
         with self.db() as d:
             es=d.execute('SELECT * FROM events'+('' if u['role']=='caterer' else ' WHERE owner=?'),() if u['role']=='caterer' else (u['id'],)).fetchall()
-            return [dict(e,quotes=[dict(q) for q in d.execute('SELECT * FROM quotes WHERE event=? ORDER BY revision DESC',(e['id'],))]) for e in es]
+            return [dict(e,quotes=[dict(q) for q in d.execute('SELECT quotes.*,quote_terms.snapshot AS terms FROM quotes LEFT JOIN quote_terms ON quote_terms.quote=quotes.id WHERE event=? ORDER BY revision DESC',(e['id'],))]) for e in es]
 
     def intake(self,u,data,request_key=None):
         if u['role']!='customer': raise PermissionError('Customer access required')
@@ -134,11 +173,14 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
         if u['role']!='customer' or kind not in ('create','capture'): raise PermissionError('Customer payment authority required')
         with self.db() as d:
             q=self.get_quote(d,u,qid)
+            self.require_current_quote(d,q)
             if not q['approved'] or not q['customer_approved']: raise PermissionError('Both quote approvals required')
             # Enforce webhook holds before any provider call or successful-operation
             # replay. Hiding checkout in the UI is not payment authorization.
             if q['payment_status']=='REVIEW_REQUIRED': raise ValueError('Payment hold requires operator review')
             if kind=='capture' and not q['order_id']: raise ValueError('Missing order')
+            if kind=='capture' and (q['capture_id'] or q['payment_status']=='COMPLETED'):
+                raise ValueError('Recorded payment requires authenticated reconciliation')
             row=d.execute('SELECT * FROM payment_operations WHERE quote=? AND kind=?',(qid,kind)).fetchone()
             if row:
                 # Uncertain operations never retry automatically, even after restart.
@@ -151,6 +193,13 @@ CREATE TRIGGER IF NOT EXISTS protect_audit_delete BEFORE DELETE ON audit BEGIN S
     def finish_payment_operation(self,u,qid,kind,provider_id=None):
         with self.db() as d:
             self.get_quote(d,u,qid)
+            existing=d.execute('SELECT * FROM payment_operations WHERE quote=? AND kind=?',(qid,kind)).fetchone()
+            if existing and existing['state']=='SUCCEEDED':
+                # A webhook/readback may finish the operation before its request
+                # returns or times out. Never downgrade that verified success.
+                if provider_id and provider_id!=existing['provider_id']:
+                    raise ValueError('Conflicting provider operation')
+                return
             if not provider_id: state='UNCERTAIN'
             else: state='SUCCEEDED'
             changed=d.execute("UPDATE payment_operations SET state=?,provider_id=?,updated=? WHERE quote=? AND kind=? AND state='IN_FLIGHT'",(state,provider_id,time.time(),qid,kind)).rowcount

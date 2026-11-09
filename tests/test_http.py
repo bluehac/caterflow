@@ -22,8 +22,8 @@ class HttpTests(unittest.TestCase):
   with self.request('/api/events') as r: csrf=json.load(r)['csrf']
   with self.assertRaises(urllib.error.HTTPError) as e: self.request('/api/inquiry',{'title':'Synthetic','guests':4,'notes':'test'})
   self.assertEqual(e.exception.code,403)
-  with self.request('/api/inquiry',{'title':'Synthetic','guests':4,'notes':'test'},csrf) as r: self.assertEqual(r.status,200)
-  with self.request('/api/events') as r: self.assertEqual(json.load(r)['events'][0]['title'],'Synthetic')
+  with self.assertRaises(urllib.error.HTTPError) as e:self.request('/api/inquiry',{'title':'Synthetic','guests':4,'notes':'test'},csrf)
+  self.assertEqual(e.exception.code,410)
   with self.assertRaises(urllib.error.HTTPError): self.request('/api/inquiry',{},csrf,'https://attacker.example')
  def test_receipt_endpoint_absent(self):
   with self.request('/api/login',{'id':'customer','password':'synthetic-password-long'}): pass

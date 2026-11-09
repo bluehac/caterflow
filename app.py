@@ -10,6 +10,7 @@ from ai import BedrockIntake
 from webhooks import Webhooks
 from sandbox_config import load_configured_secrets
 from urllib.parse import urlsplit
+from abuse import reserve,verify,public_config,RateLimited,VerificationUnavailable
 
 load_configured_secrets()
 ORIGIN=os.environ.get('CATERFLOW_PUBLIC_ORIGIN','http://127.0.0.1:8080')
@@ -21,12 +22,25 @@ SECURE_COOKIE='; Secure' if parsed_origin.scheme=='https' else ''
 STATIC=Path(__file__).resolve().parent/'static'
 store=Store(os.environ.get('CATERFLOW_DB','caterflow.db'))
 attempts={}
+def demo_terms_enabled():
+    return os.environ.get('CATERFLOW_SYNTHETIC_DEPOSITS')=='true'
+
+def synthetic_terms(guests, service):
+    return (
+        {'approved':True,'version':'synthetic-v1','tax_source':'Fictional demonstration rate',
+         'valid_until':'2099-01-01','min_guests':1,'max_guests':1000,'deposit_rate':'0.25',
+         'packages':{'dinner':{'label':'Sample dinner','per_guest':'24.00'}},
+         'services':{'delivery':{'fixed':'45.00','rate':'0','taxable':True},
+                     'pickup':{'fixed':'0','rate':'0','taxable':False}},
+         'tax_zones':{'demo':{'rate':'0.0825'}},'addons':{}},
+        {'guests':guests,'package':'dinner','service':service,'tax_zone':'demo'})
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
     def reply(self,status,data,cookie=None,html=False):
         payload=data.encode() if html else json.dumps(data).encode()
         self.send_response(status); self.send_header('Content-Type','text/html; charset=utf-8' if html else 'application/json'); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('X-Frame-Options','DENY'); self.send_header('Referrer-Policy','no-referrer')
-        self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; img-src 'self' blob: data:")
         if cookie: self.send_header('Set-Cookie',cookie)
         self.send_header('Content-Length',str(len(payload))); self.end_headers(); self.wfile.write(payload)
     def token(self):
@@ -37,9 +51,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.headers.get('Host')!=HOST: return self.reply(403,{'error':'Host rejected'})
         if self.path in ('/','/catering'): return self.reply(200,(STATIC/('lbk.html' if self.path=='/catering' else 'index.html')).read_text(),html=True)
+        if self.path=='/api/security':return self.reply(200,public_config())
+        if self.path=='/botguard.js':
+            payload=(STATIC/'botguard.js').read_bytes();self.send_response(200);self.send_header('Content-Type','application/javascript');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(payload)));self.end_headers();self.wfile.write(payload);return
         try:
             s=self.user()
-            if self.path=='/api/events': return self.reply(200,{'events':store.list(s['user']),'user':s['user'],'csrf':s['csrf'],'ai_drafting':os.environ.get('CATERFLOW_AI_ENABLED')=='true','sandbox_checkout':os.environ.get('CATERFLOW_PAYPAL_ENABLED')=='true' and PayPal().configured})
+            if self.path=='/api/events': return self.reply(200,{'synthetic_deposits':demo_terms_enabled(),'events':store.list(s['user']),'user':s['user'],'csrf':s['csrf'],'ai_drafting':os.environ.get('CATERFLOW_AI_ENABLED')=='true','photo_intake':os.environ.get('CATERFLOW_AI_ENABLED')=='true' and os.environ.get('CATERFLOW_PHOTO_ENABLED')=='true','sandbox_checkout':os.environ.get('CATERFLOW_PAYPAL_ENABLED')=='true' and PayPal().configured})
             self.reply(404,{'error':'Not found'})
         except PermissionError as e: self.reply(403,{'error':str(e)})
     def do_POST(self):
@@ -48,7 +65,14 @@ class Handler(BaseHTTPRequestHandler):
             webhook=self.path=='/api/paypal/webhook'
             if not webhook and self.headers.get('Origin')!=ORIGIN: raise PermissionError('Origin rejected')
             size=int(self.headers.get('Content-Length','0'))
-            if not 0<size<=8192: raise ValueError('Invalid request size')
+            limit=8192
+            if self.path=='/api/ai/draft' and os.environ.get('CATERFLOW_PHOTO_ENABLED')=='true':
+                # Authenticate BEFORE reading an expanded photo payload.
+                pre=self.user()
+                if pre['user']['role']!='customer' or not secrets.compare_digest(self.headers.get('X-CSRF-Token',''),pre['csrf']):raise PermissionError('Request verification failed')
+                from vision import MAX_IMAGE_REQUEST
+                limit=MAX_IMAGE_REQUEST
+            if not 0<size<=limit: raise ValueError('Invalid request size')
             if self.headers.get('Content-Type')!='application/json': raise ValueError('JSON required')
             b=json.loads(self.rfile.read(size))
             if not isinstance(b,dict): raise ValueError('JSON object required')
@@ -56,15 +80,29 @@ class Handler(BaseHTTPRequestHandler):
                 if os.environ.get('CATERFLOW_PAYPAL_ENABLED')!='true': raise ValueError('Sandbox checkout disabled')
                 return self.reply(200,Webhooks(store,PayPal()).handle(b,dict(self.headers)))
             if self.path=='/api/login':
-                ip=self.client_address[0]; recent=[t for t in attempts.get(ip,[]) if time.time()-t<60]; attempts[ip]=recent+[time.time()]
-                if len(recent)>=10: raise PermissionError('Wait a minute before trying again')
+                # Count failures only. Never trust client-supplied forwarded IPs.
+                # Keep the existing 10-failure/60s policy; bound process memory.
+                ip=self.client_address[0]; now=time.time()
+                for key,values in list(attempts.items()):
+                    recent=[t for t in values if now-t<60]
+                    if recent:attempts[key]=recent
+                    else:attempts.pop(key,None)
+                recent=attempts.get(ip,[])
+                if len(recent)>=10 or (ip not in attempts and len(attempts)>=1024): raise PermissionError('Wait a minute before trying again')
+                verify(self.headers.get('X-Turnstile-Token',''),'login',parsed_origin.hostname)
                 u=store.login(str(b.get('id','')),str(b.get('password','')))
-                if not u: raise PermissionError('Sign-in failed')
+                if not u:
+                    attempts[ip]=recent+[now]
+                    raise PermissionError('Sign-in failed')
                 sid,_=store.new_session(u)
                 return self.reply(200,{'ok':True},'cf_session='+sid+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600'+SECURE_COOKIE)
             s=self.user()
             if not secrets.compare_digest(self.headers.get('X-CSRF-Token',''),s['csrf']): raise PermissionError('Request verification failed')
             u=s['user']
+            if self.path in ('/api/intake','/api/ai/draft'):
+                if u['role']!='customer':raise PermissionError('Customer access required')
+                reserve(store,u['id'],'intake' if self.path=='/api/intake' else 'ai')
+                verify(self.headers.get('X-Turnstile-Token',''),'intake' if self.path=='/api/intake' else 'ai',parsed_origin.hostname)
             if self.path in ('/api/payment/create','/api/payment/capture','/api/payment/reconcile'):
                 if os.environ.get('CATERFLOW_PAYPAL_ENABLED')!='true': raise ValueError('Sandbox checkout disabled')
                 service=Payments(store,PayPal())
@@ -76,16 +114,25 @@ class Handler(BaseHTTPRequestHandler):
                     result={'approval_url':links[0]}
                 elif self.path.endswith('/capture'): result=service.capture(u,b['quote'])
                 else: result=service.reconcile(u,b['quote'])
-            elif self.path=='/api/ai/draft': result=BedrockIntake(store).draft(u,b['text'],b.get('language','en'))
+            elif self.path=='/api/ai/draft': result=BedrockIntake(store).draft(u,b.get('text',''),b.get('language','en'),photo=b.get('photo'))
             elif self.path=='/api/intake': result=store.intake(u,b,self.headers.get('Idempotency-Key'))
-            elif self.path=='/api/inquiry': result=store.event(u,b['title'],b['guests'],b['notes'])
-            elif self.path=='/api/quote': result=store.quote(u,b['event'],b['price'])
+            elif self.path=='/api/inquiry':return self.reply(410,{'error':'Use the reviewed catering intake form'})
+            elif self.path=='/api/quote':
+                if 'service' in b:
+                    if not demo_terms_enabled() or u['role']!='caterer':raise PermissionError('Synthetic quote unavailable')
+                    if set(b)-{'event','service','corrects'}:raise ValueError('Unexpected quote fields')
+                    with store.db() as db: guests=store.allowed(db,u,b['event'])['guests']
+                    policy,selection=synthetic_terms(guests,b['service'])
+                    result=store.quote(u,b['event'],'24.00',corrects=b.get('corrects'),policy=policy,selection=selection)
+                else: result=store.quote(u,b['event'],b['price'])
             elif self.path=='/api/approve': result=store.approve(u,b['quote'])
             elif self.path=='/api/book': result=store.book(u,b['quote'])
             elif self.path=='/api/logout':
                 store.logout(self.token()); return self.reply(200,{'ok':True},'cf_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'+SECURE_COOKIE)
             else: return self.reply(404,{'error':'Not found'})
             self.reply(200,{'result':result})
+        except RateLimited as e:self.reply(429,{'error':str(e)})
+        except VerificationUnavailable as e:self.reply(503,{'error':str(e)})
         except PermissionError as e: self.reply(403,{'error':str(e)})
         except (ValueError,KeyError,TypeError,sqlite3.IntegrityError): self.reply(400,{'error':'Request could not be completed. Check details and current event state.'})
         except Exception: self.reply(500,{'error':'Request failed safely; review local state before retrying'})
