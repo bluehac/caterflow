@@ -22,6 +22,19 @@ SECURE_COOKIE='; Secure' if parsed_origin.scheme=='https' else ''
 STATIC=Path(__file__).resolve().parent/'static'
 store=Store(os.environ.get('CATERFLOW_DB','caterflow.db'))
 attempts={}
+def demo_terms_enabled():
+    return os.environ.get('CATERFLOW_SYNTHETIC_DEPOSITS')=='true'
+
+def synthetic_terms(guests, service):
+    return (
+        {'approved':True,'version':'synthetic-v1','tax_source':'Fictional demonstration rate',
+         'valid_until':'2099-01-01','min_guests':1,'max_guests':1000,'deposit_rate':'0.25',
+         'packages':{'dinner':{'label':'Sample dinner','per_guest':'24.00'}},
+         'services':{'delivery':{'fixed':'45.00','rate':'0','taxable':True},
+                     'pickup':{'fixed':'0','rate':'0','taxable':False}},
+         'tax_zones':{'demo':{'rate':'0.0825'}},'addons':{}},
+        {'guests':guests,'package':'dinner','service':service,'tax_zone':'demo'})
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
     def reply(self,status,data,cookie=None,html=False):
@@ -43,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
             payload=(STATIC/'botguard.js').read_bytes();self.send_response(200);self.send_header('Content-Type','application/javascript');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(payload)));self.end_headers();self.wfile.write(payload);return
         try:
             s=self.user()
-            if self.path=='/api/events': return self.reply(200,{'events':store.list(s['user']),'user':s['user'],'csrf':s['csrf'],'ai_drafting':os.environ.get('CATERFLOW_AI_ENABLED')=='true','photo_intake':os.environ.get('CATERFLOW_AI_ENABLED')=='true' and os.environ.get('CATERFLOW_PHOTO_ENABLED')=='true','sandbox_checkout':os.environ.get('CATERFLOW_PAYPAL_ENABLED')=='true' and PayPal().configured})
+            if self.path=='/api/events': return self.reply(200,{'synthetic_deposits':demo_terms_enabled(),'events':store.list(s['user']),'user':s['user'],'csrf':s['csrf'],'ai_drafting':os.environ.get('CATERFLOW_AI_ENABLED')=='true','photo_intake':os.environ.get('CATERFLOW_AI_ENABLED')=='true' and os.environ.get('CATERFLOW_PHOTO_ENABLED')=='true','sandbox_checkout':os.environ.get('CATERFLOW_PAYPAL_ENABLED')=='true' and PayPal().configured})
             self.reply(404,{'error':'Not found'})
         except PermissionError as e: self.reply(403,{'error':str(e)})
     def do_POST(self):
@@ -104,7 +117,14 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path=='/api/ai/draft': result=BedrockIntake(store).draft(u,b.get('text',''),b.get('language','en'),photo=b.get('photo'))
             elif self.path=='/api/intake': result=store.intake(u,b,self.headers.get('Idempotency-Key'))
             elif self.path=='/api/inquiry':return self.reply(410,{'error':'Use the reviewed catering intake form'})
-            elif self.path=='/api/quote': result=store.quote(u,b['event'],b['price'])
+            elif self.path=='/api/quote':
+                if 'service' in b:
+                    if not demo_terms_enabled() or u['role']!='caterer':raise PermissionError('Synthetic quote unavailable')
+                    if set(b)-{'event','service','corrects'}:raise ValueError('Unexpected quote fields')
+                    with store.db() as db: guests=store.allowed(db,u,b['event'])['guests']
+                    policy,selection=synthetic_terms(guests,b['service'])
+                    result=store.quote(u,b['event'],'24.00',corrects=b.get('corrects'),policy=policy,selection=selection)
+                else: result=store.quote(u,b['event'],b['price'])
             elif self.path=='/api/approve': result=store.approve(u,b['quote'])
             elif self.path=='/api/book': result=store.book(u,b['quote'])
             elif self.path=='/api/logout':
