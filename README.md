@@ -5,16 +5,23 @@
 Owner: Franklyn Rosario, MBA-ITM. AIZOYA OS 2.6 governs; OS 2.7 remains candidate.
 Working title; trademark clearance incomplete. Synthetic customer details only.
 
-## Verified state — reconciled November 7, 2026 (Pacific)
+## From catering inquiry to confirmed booking
 
-- Isolated HTTPS sandbox deployed at https://caterflow-sandbox.aizoya.com. This is separate from the public La Bandera Kitchen website.
-- Detailed bilingual inquiry persisted through the customer browser; caterer quote revision and customer approval verified. Twelve optional detail fields are preserved.
-- Actual PayPal sandbox order/capture succeeded November 4. App refresh retained payment verification; provider API log showed capture 201 and authenticated order reads 200. 
-- Caterer booking confirmation was verified November 6 and survived browser refresh. Actual signature-verified webhook delivery remains unverified. Registration and OAuth are verified; registration alone is not delivery evidence.
-- Hosted Amazon Bedrock Claude Sonnet 4.6 drafting is enabled. Real English and Spanish calls passed through the installed adapter and signed-in browser. Suggestions stayed separate from form fields until explicit customer acceptance, remained editable, and did not create events or alter quotes. Allergy notes require caterer review and do not promise safety.
-- All 86 local tests passed after the payment-hold fix. Four focused regression tests also passed against installed server modules using mocked providers and temporary databases. The server now rejects payment-operation admission and completed-operation replay while a quote is on hold. These tests do not prove real webhook delivery or all concurrency cases.
+CaterFlow connects bilingual, customer-reviewed AI intake to a caterer-prepared quote, customer approval, PayPal sandbox payment verification and a separate caterer booking decision.
 
-**Development prototype.** Source is released under MIT. Public video, judge-access instructions and final submission remain outstanding. The current hosted AI attempt limit is deliberately small and operator-controlled; it is a request cap, not an account-wide dollar cap. Actual signed webhook delivery and outage fallback remain unverified.
+- [Public showcase and judge guide](https://caterflow.aizoya.com) · [53-second illustrated walkthrough](https://www.youtube.com/watch?v=w0jjRP7LZ84)
+- [Hosted bilingual sandbox](https://caterflow-sandbox.aizoya.com/catering) uses synthetic data only. Full testing requires separate provisioned customer and caterer accounts. Private judge access is pending.
+- [Release candidate](https://github.com/bluehac/caterflow/pull/1) is a draft PR; do not assume the default branch matches the hosted runtime.
+
+## Verified evidence — November 8, 2026
+
+137 Python tests and 10 simulated DOM tests passed locally; 49 overlapping tests passed against installed modules with temporary data and mocked providers. Prior signed-in English and Spanish Bedrock drafting and actual PayPal sandbox capture/readback were verified. A subsequent synthetic image request produced a validated review-required draft; image recognition quality was not established. Actual signed webhook delivery and native iPhone media acceptance remain unverified.
+
+AI suggestions require explicit customer review. AI does not set prices, move money, confirm bookings, or establish ingredient or allergy safety. Refund/reversal reconciliation, operator hold resolution, and business isolation are commercial launch gates.
+
+## Pilot and revenue hypotheses
+
+Start with owner-operated caterers managing custom quotes across texts, email and spreadsheets. Recruit five design partners and measure quote turnaround, onboarding, support and willingness to pay. Proposed $99 Starter and $199 Team pricing at a 50/50 mix yields $149 per business/month; 100 paying businesses imply $178,800 modeled ARR. No paid subscriptions or retention are verified.
 
 ## Run locally
 
